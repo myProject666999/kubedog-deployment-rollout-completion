@@ -1,0 +1,247 @@
+package event
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	apilabels "k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
+
+	"github.com/werf/kubedog/pkg/dyntracker/util"
+	"github.com/werf/kubedog/pkg/informer"
+	"github.com/werf/kubedog/pkg/log"
+	"github.com/werf/kubedog/pkg/tracker"
+	"github.com/werf/kubedog/pkg/utils"
+)
+
+type ProbeTriggeredRestart struct {
+	ContainerName string
+	Message       string
+}
+
+type ReadinessProbeFailure struct {
+	ContainerName string
+	Message       string
+}
+
+type EventInformer struct {
+	tracker.Tracker
+	Resource interface{}
+	Messages chan string
+	Failures chan interface{}
+	Errors   chan error
+
+	initialEventUids map[types.UID]bool
+}
+
+func NewEventInformer(trk *tracker.Tracker, resource interface{}) *EventInformer {
+	return &EventInformer{
+		Tracker: tracker.Tracker{
+			Kube:             trk.Kube,
+			Namespace:        trk.Namespace,
+			ResourceName:     trk.ResourceName,
+			FullResourceName: trk.FullResourceName,
+			InformerFactory:  trk.InformerFactory,
+		},
+		Resource:         resource,
+		Errors:           make(chan error, 1),
+		initialEventUids: make(map[types.UID]bool),
+	}
+}
+
+func (e *EventInformer) WithChannels(msgCh chan string, failCh chan interface{}, errors chan error) *EventInformer {
+	e.Messages = msgCh
+	e.Failures = failCh
+	e.Errors = errors
+	return e
+}
+
+// Run watch for StatefulSet events
+func (e *EventInformer) Run(ctx context.Context) (cleanupFn func(), err error) {
+	ctx, stopSending := context.WithCancel(ctx)
+	defer func() {
+		if err != nil {
+			stopSending()
+		}
+	}()
+
+	var inform *util.Concurrent[*informer.Informer]
+	if err := e.InformerFactory.RWTransactionErr(func(factory *informer.InformerFactory) error {
+		inform, err = factory.ForNamespace(schema.GroupVersionResource{
+			Group:    "",
+			Version:  "v1",
+			Resource: "events",
+		}, e.Namespace, informer.InformerOptions{
+			ForbiddenIsNotFatal: true,
+		})
+		if err != nil {
+			return fmt.Errorf("get informer from factory: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	involvedObjMetadata, err := meta.Accessor(e.Resource)
+	if err != nil {
+		return nil, fmt.Errorf("get involved object metadata: %w", err)
+	}
+
+	if err := inform.RWTransactionErr(func(inf *informer.Informer) error {
+		if err := e.handleInitialEvents(inf, string(involvedObjMetadata.GetUID())); err != nil {
+			return fmt.Errorf("handle initial events: %w", err)
+		}
+
+		handler, err := inf.AddEventHandler(
+			cache.FilteringResourceEventHandler{
+				FilterFunc: func(obj interface{}) bool {
+					if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+						obj = d.Obj
+					}
+
+					eventObj := &corev1.Event{}
+					lo.Must0(runtime.DefaultUnstructuredConverter.FromUnstructured(obj.(*unstructured.Unstructured).Object, eventObj))
+					return eventObj.InvolvedObject.UID == involvedObjMetadata.GetUID()
+				},
+				Handler: cache.ResourceEventHandlerFuncs{
+					AddFunc: func(obj interface{}) {
+						if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+							obj = d.Obj
+						}
+
+						eventObj := &corev1.Event{}
+						lo.Must0(runtime.DefaultUnstructuredConverter.FromUnstructured(obj.(*unstructured.Unstructured).Object, eventObj))
+						e.handleEvent(ctx, eventObj)
+					},
+					UpdateFunc: func(oldObj, newObj interface{}) {
+						if d, ok := newObj.(cache.DeletedFinalStateUnknown); ok {
+							newObj = d.Obj
+						}
+
+						eventObj := &corev1.Event{}
+						lo.Must0(runtime.DefaultUnstructuredConverter.FromUnstructured(newObj.(*unstructured.Unstructured).Object, eventObj))
+						e.handleEvent(ctx, eventObj)
+					},
+				},
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("add event handler: %w", err)
+		}
+
+		cleanupFn = func() {
+			stopSending()
+			inf.RemoveEventHandler(handler)
+		}
+
+		inf.Run()
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return cleanupFn, nil
+}
+
+// handleInitialEvents saves uids of existed k8s events to ignore watch.Added events on them
+func (e *EventInformer) handleInitialEvents(inform *informer.Informer, involvedUID string) error {
+	objs, err := inform.List(apilabels.Everything())
+	if err != nil {
+		return fmt.Errorf("list events: %w", err)
+	}
+
+	var filteredEvents []*corev1.Event
+	for _, obj := range objs {
+		eventObj := &corev1.Event{}
+		lo.Must0(runtime.DefaultUnstructuredConverter.FromUnstructured(obj.(*unstructured.Unstructured).Object, eventObj))
+
+		if string(eventObj.InvolvedObject.UID) == involvedUID {
+			filteredEvents = append(filteredEvents, eventObj)
+		}
+	}
+
+	for _, event := range filteredEvents {
+		e.initialEventUids[event.UID] = true
+	}
+
+	return nil
+}
+
+// handleEvent sends a message to Messages channel for all events and a message to Failures channel for Failed events
+func (e *EventInformer) handleEvent(ctx context.Context, event *corev1.Event) {
+	if _, ok := e.initialEventUids[event.UID]; ok {
+		delete(e.initialEventUids, event.UID)
+		return
+	}
+
+	// Docker Hub leaks username and token, so we sanitize the message
+	if strings.Contains(event.Message, "You have reached your pull rate limit as") {
+		regex := regexp.MustCompile(`(.*You have reached your pull rate limit) as .*`)
+		sub := regex.FindStringSubmatch(event.Message)
+		if sub != nil {
+			event.Message = sub[1]
+		}
+	}
+
+	msg := fmt.Sprintf("%s: %s", event.Reason, event.Message)
+
+	if log.Debug() {
+		fmt.Printf("  %s got normal event: %s\n", e.FullResourceName, msg)
+	}
+
+	utils.SendOrDone(ctx, e.Messages, msg)
+
+	switch resource := e.Resource.(type) {
+	case *corev1.Pod:
+		e.handlePodEvent(ctx, event, resource, msg)
+	default:
+		e.handleRegularEvent(ctx, event, msg)
+	}
+}
+
+func (e *EventInformer) handleRegularEvent(ctx context.Context, event *corev1.Event, msg string) {
+	if strings.Contains(event.Reason, "RecreatingFailedPod") ||
+		strings.Contains(event.Reason, "FailedDelete") {
+		return
+	}
+
+	if strings.Contains(event.Reason, "Failed") {
+		if log.Debug() {
+			fmt.Printf("got FAILED EVENT!!! %s\n", msg)
+		}
+		utils.SendOrDone[interface{}](ctx, e.Failures, msg)
+	}
+}
+
+func (e *EventInformer) handlePodEvent(ctx context.Context, event *corev1.Event, pod *corev1.Pod, msg string) {
+	if pod.ObjectMeta.DeletionTimestamp != nil {
+		return
+	}
+
+	if matched, err := regexp.MatchString(`failed (startup|liveness) probe, will be restarted`, event.Message); err != nil {
+		panic("can't compile regex")
+	} else if matched {
+		utils.SendOrDone[interface{}](ctx, e.Failures, ProbeTriggeredRestart{
+			ContainerName: strings.TrimSuffix(strings.Split(event.InvolvedObject.FieldPath, "{")[1], "}"),
+			Message:       msg,
+		})
+	}
+
+	if strings.Contains(event.Message, "Readiness probe failed:") {
+		utils.SendOrDone[interface{}](ctx, e.Failures, ReadinessProbeFailure{
+			ContainerName: strings.TrimSuffix(strings.Split(event.InvolvedObject.FieldPath, "{")[1], "}"),
+			Message:       msg,
+		})
+	}
+}

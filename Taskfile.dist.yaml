@@ -1,0 +1,34 @@
+version: "3"
+
+silent: true
+
+vars:
+  golangciLintVersion: "v2.5.0"
+
+includes:
+  lint:
+    taskfile: https://raw.githubusercontent.com/werf/common-ci/refs/heads/main/Taskfile.format_lint.yml
+    flatten: true
+    vars:
+      paths: "."
+      golangciLintVersion: "{{.golangciLintVersion}}"
+      golangciConfigPath: ".golangci.yaml"
+  deps:
+    taskfile: https://raw.githubusercontent.com/werf/common-ci/refs/heads/main/Taskfile.deps.yml
+    flatten: true
+    vars:
+      golangciLintVersion: "{{.golangciLintVersion}}"
+
+tasks:
+  sign:
+    desc: 'Sign last version tag + origin/main and push signatures. Important vars: "refs".'
+    cmds:
+      - git fetch --tags -f
+      - git signatures pull {{.CLI_ARGS}}
+      - |
+        for ref in {{.refs | default "$(git tag --sort=v:refname | tail -n1) origin/main origin/trdl"}}; do
+          echo Signing $ref...
+          git signatures add {{.CLI_ARGS}} $ref
+          git signatures show {{.CLI_ARGS}} $ref
+        done
+      - git signatures push {{.CLI_ARGS}}
