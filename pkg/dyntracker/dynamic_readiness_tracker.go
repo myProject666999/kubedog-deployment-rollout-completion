@@ -120,6 +120,7 @@ func NewDynamicReadinessTracker(
 			SaveLogsOnlyForNumberOfReplicas:          opts.SaveLogsOnlyForNumberOfReplicas,
 			IgnoreLogs:                               opts.IgnoreLogs,
 			IgnoreReadinessProbeFailsByContainerName: ignoreReadinessProbeFailsByContainerName,
+			DeploymentStrictCompletion:               opts.DeploymentStrictCompletion,
 		})
 	case schema.GroupKind{Group: "apps", Kind: "daemonset"}, schema.GroupKind{Group: "extensions", Kind: "daemonset"}:
 		tracker = daemonset.NewTracker(resourceName, resourceNamespace, staticClient, informerFactory, commontracker.Options{
@@ -205,6 +206,9 @@ type DynamicReadinessTrackerOptions struct {
 	IgnoreLogsByRegex                        *regexp.Regexp
 	IgnoreLogsByRegexForContainers           map[string]*regexp.Regexp
 	SaveEvents                               bool
+	// DeploymentStrictCompletion opts the Deployment tracker into the strict
+	// NewReplicaSetAvailable completion gate. Only applies to Deployment tracking.
+	DeploymentStrictCompletion bool
 }
 
 func (t *DynamicReadinessTracker) Track(ctx context.Context) error {

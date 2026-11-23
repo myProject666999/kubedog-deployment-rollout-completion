@@ -46,4 +46,9 @@ type Options struct {
 	SaveLogsOnlyForNumberOfReplicas          int
 	IgnoreLogs                               bool
 	IgnoreReadinessProbeFailsByContainerName map[string]time.Duration
+
+	// DeploymentStrictCompletion enables the Deployment-specific strict completion gate:
+	// readiness additionally requires a Progressing condition reporting
+	// NewReplicaSetAvailable once the controller has written a condition. Defaults off.
+	DeploymentStrictCompletion bool
 }

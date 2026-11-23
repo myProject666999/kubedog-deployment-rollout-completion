@@ -56,6 +56,8 @@ type harnessConfig struct {
 	prepareKubeClient    func(*k8sfake.Clientset)
 	// quotaDeadlockConfirmation defaults to a short period to keep fatal quota tests fast.
 	quotaDeadlockConfirmation time.Duration
+	// strictCompletion enables the NewReplicaSetAvailable completion gate on the tracker.
+	strictCompletion bool
 }
 
 type harness struct {
@@ -94,7 +96,10 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 	watchErrCh := make(chan error, 100)
 	factory := informer.NewConcurrentInformerFactory(ctx.Done(), watchErrCh, dynClient, informer.ConcurrentInformerFactoryOptions{})
 
-	trk := deployment.NewTracker(testDeploymentName, testNamespace, kubeClient, factory, tracker.Options{IgnoreLogs: true})
+	trk := deployment.NewTracker(testDeploymentName, testNamespace, kubeClient, factory, tracker.Options{
+		IgnoreLogs:                 true,
+		DeploymentStrictCompletion: cfg.strictCompletion,
+	})
 	quotaDeadlockConfirmation := cfg.quotaDeadlockConfirmation
 	if quotaDeadlockConfirmation == 0 {
 		quotaDeadlockConfirmation = 50 * time.Millisecond

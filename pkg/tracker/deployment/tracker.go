@@ -63,6 +63,11 @@ type Tracker struct {
 	podStatuses                map[string]pod.PodStatus
 	rsNameByPod                map[string]string
 
+	// progressDeadlineExceeded remembers a reported ProgressDeadlineExceeded so the same
+	// condition is charged to the error budget once, mirroring reportedReplicaSetFailures.
+	progressDeadlineExceeded bool
+	strictCompletion         bool
+
 	ignoreLogs                               bool
 	ignoreReadinessProbeFailsByContainerName map[string]time.Duration
 	savingLogsReplicas                       int
@@ -132,6 +137,7 @@ func NewTracker(name, namespace string, kube kubernetes.Interface, informerFacto
 
 		ignoreLogs:                               opts.IgnoreLogs,
 		ignoreReadinessProbeFailsByContainerName: opts.IgnoreReadinessProbeFailsByContainerName,
+		strictCompletion:                         opts.DeploymentStrictCompletion,
 
 		errors:           make(chan error, 1),
 		resourceAdded:    make(chan *appsv1.Deployment, 1),
@@ -181,6 +187,9 @@ func (d *Tracker) Track(ctx context.Context) (err error) {
 			if err := d.handleNewReplicaSetFailure(ctx); err != nil {
 				return err
 			}
+			if err := d.handleProgressDeadlineFailure(ctx); err != nil {
+				return err
+			}
 		case object := <-d.resourceModified:
 			cleanupFn, err := d.handleDeploymentState(ctx, object)
 			if err != nil {
@@ -188,6 +197,9 @@ func (d *Tracker) Track(ctx context.Context) (err error) {
 			}
 			defer cleanupFn()
 			if err := d.handleNewReplicaSetFailure(ctx); err != nil {
+				return err
+			}
+			if err := d.handleProgressDeadlineFailure(ctx); err != nil {
 				return err
 			}
 		case <-d.resourceDeleted:
@@ -198,9 +210,11 @@ func (d *Tracker) Track(ctx context.Context) (err error) {
 			d.reportedReplicaSetFailures = make(map[types.UID]struct{})
 			d.quotaDeadlockSince = make(map[types.UID]time.Time)
 			d.failedFromReplicaSetUID = ""
+			d.progressDeadlineExceeded = false
 			d.podStatuses = make(map[string]pod.PodStatus)
 			d.rsNameByPod = make(map[string]string)
 			d.TrackedPodsNames = nil
+			d.Conditions = nil
 			d.Status <- DeploymentStatus{}
 
 		case failure := <-d.resourceFailed:
@@ -670,6 +684,11 @@ func (d *Tracker) runPodTracker(_ctx context.Context, podName, rsName string) er
 
 func (d *Tracker) handleDeploymentState(ctx context.Context, object *appsv1.Deployment) (cleanupFn func(), err error) {
 	d.lastObject = object
+	d.Conditions = deploymentConditionSummaries(object)
+
+	// Re-arm before building the status so a recovered Progressing condition moves the tracker
+	// out of ResourceFailed before the state switch evaluates the fresh snapshot.
+	d.rearmProgressFailure(object)
 
 	status, err := d.newStatus(object)
 	if err != nil {
@@ -770,5 +789,7 @@ func (d *Tracker) newStatus(object *appsv1.Deployment) (DeploymentStatus, error)
 		return DeploymentStatus{}, err
 	}
 
-	return NewDeploymentStatus(object, d.StatusGeneration, false, "", d.podStatuses, newPodsNames), nil
+	return NewDeploymentStatus(object, d.StatusGeneration, false, "", d.podStatuses, newPodsNames, StatusOptions{
+		StrictCompletion: d.strictCompletion,
+	}), nil
 }
